@@ -2,6 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- カメラ使用許可のダイアログに表示されるメッセージ（必須） -->
+	<key>NSCameraUsageDescription</key>
+	<string>LiDARで空間をスキャンするためにカメラを使用します</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

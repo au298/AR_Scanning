@@ -50,7 +50,7 @@ final class LiDARScanningViewModel {
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var samplingTimer: Timer?
 
-    /// スキャン中に1秒ごとサンプリングしたARFrameを同期的に保持する（最大8枚）
+    /// スキャン中に0.5秒ごとサンプリングしたARFrameを同期的に保持する（最大16枚）
     /// - 非同期変換はせずそのまま保持し、保存時にまとめてJPEG変換することで
     ///   stopAndSave() 呼び出し時点で確実にデータが揃っている状態にする
     @ObservationIgnored private var sampledARFrames: [ARFrame] = []
@@ -76,6 +76,17 @@ final class LiDARScanningViewModel {
         configuration.sceneReconstruction = .mesh
         configuration.planeDetection = [.horizontal, .vertical]
 
+        // 解像度最優先・同解像度なら高fps優先でフォーマットを選択する
+        // 以前の単純な60fps優先は解像度を下げてしまい追跡精度が悪化したため、
+        // 解像度を犠牲にせず最大fpsを狙うソートに変更
+        if let fmt = ARWorldTrackingConfiguration.supportedVideoFormats.sorted(by: {
+            let p0 = $0.imageResolution.width * $0.imageResolution.height
+            let p1 = $1.imageResolution.width * $1.imageResolution.height
+            return p0 != p1 ? p0 > p1 : $0.framesPerSecond > $1.framesPerSecond
+        }).first {
+            configuration.videoFormat = fmt
+        }
+
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             configuration.frameSemantics.insert(.sceneDepth)
         }
@@ -88,8 +99,8 @@ final class LiDARScanningViewModel {
             self?.elapsedSeconds += 1
         }
 
-        // 1秒ごとにARFrameを同期的に保持（JPEG変換は保存時にまとめて行う）
-        samplingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        // 0.5秒ごとにARFrameを同期的に保持（1秒より頻度を上げて角度カバレッジを改善）
+        samplingTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.sampleCurrentFrame()
         }
     }
@@ -131,7 +142,7 @@ final class LiDARScanningViewModel {
                 // 停止直前フレームを末尾に追加（既存フレームとの重複は許容）
                 if let frame = lastARFrame,
                    let jpeg = self.pixelBufferToJPEG(frame.capturedImage) {
-                    if frames.count >= 8 { frames.removeFirst() }
+                    if frames.count >= 16 { frames.removeFirst() }
                     frames.append(SampledFrame(
                         cameraTransform: frame.camera.transform,
                         intrinsics: frame.camera.intrinsics,
@@ -233,7 +244,7 @@ final class LiDARScanningViewModel {
     /// - JPEG変換は行わず参照だけ保持することで、stopAndSave() 時点で確実にデータが揃う
     private func sampleCurrentFrame() {
         guard let frame = arSession?.currentFrame else { return }
-        if sampledARFrames.count >= 8 { sampledARFrames.removeFirst() }
+        if sampledARFrames.count >= 16 { sampledARFrames.removeFirst() }
         sampledARFrames.append(frame)
     }
 
@@ -290,7 +301,7 @@ final class LiDARScanningViewModel {
     // MARK: - プライベート：画像変換
 
     /// CVPixelBuffer（YCbCr形式）をJPEGのDataに変換する
-    private func pixelBufferToJPEG(_ buffer: CVPixelBuffer, quality: CGFloat = 0.82) -> Data? {
+    private func pixelBufferToJPEG(_ buffer: CVPixelBuffer, quality: CGFloat = 0.93) -> Data? {
         let ciImage = CIImage(cvPixelBuffer: buffer)
         let context = CIContext(options: [.useSoftwareRenderer: false])
         guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }

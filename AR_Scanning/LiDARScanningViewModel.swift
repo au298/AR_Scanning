@@ -76,11 +76,6 @@ final class LiDARScanningViewModel {
         configuration.sceneReconstruction = .meshWithClassification
         configuration.planeDetection = [.horizontal, .vertical]
 
-        // 60fps対応フォーマットがあれば優先（フレーム数増→メッシュ更新速度向上）
-        if let fmt = ARWorldTrackingConfiguration.supportedVideoFormats.first(where: { $0.framesPerSecond >= 60 }) {
-            configuration.videoFormat = fmt
-        }
-
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             configuration.frameSemantics.insert(.sceneDepth)
         }

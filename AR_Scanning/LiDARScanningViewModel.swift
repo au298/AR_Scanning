@@ -49,6 +49,10 @@ final class LiDARScanningViewModel {
     @ObservationIgnored
     var meshAnchors: [UUID: ARMeshAnchor] = [:]
 
+    /// VRビューアに渡すスナップショット（.displaying 状態のときだけ非nil）
+    @ObservationIgnored
+    var currentSnapshot: MeshSnapshot?
+
     /// 経過時間を1秒ごとに更新するタイマー
     @ObservationIgnored
     private var timer: Timer?
@@ -149,29 +153,17 @@ final class LiDARScanningViewModel {
         }
     }
 
-    // MARK: - メッシュAR表示
+    // MARK: - メッシュVR表示
 
-    /// 保存済みメッシュをカメラ前方に3Dオブジェクトとして表示する
+    /// 保存済みメッシュをVRビューア（SceneKit）で表示するためにスナップショットを読み込む
     func startDisplaying(url: URL) {
-        // ARSeessionとARViewの両方が必要
-        guard let session = arSession, let arView = arView else {
-            scanState = .error("ARViewが初期化されていません")
-            return
-        }
-
-        // メッシュ構築中状態に遷移
         scanState = .loadingDisplay
 
-        // メッシュ読み込みと配置を非同期で実行（MeshResource生成が重いため）
         Task {
             do {
-                // バイナリPropertyListファイルを読み込む
                 let data = try Data(contentsOf: url)
-
-                // MeshSnapshotにデコード
                 let snapshot = try PropertyListDecoder().decode(MeshSnapshot.self, from: data)
 
-                // スナップショットが空の場合
                 guard !snapshot.anchors.isEmpty else {
                     await MainActor.run {
                         self.scanState = .error("保存済みメッシュが空でした")
@@ -179,75 +171,12 @@ final class LiDARScanningViewModel {
                     return
                 }
 
-                // カメラパススルー用のシンプルなARセッションを開始（WorldMapなし）
-                let configuration = ARWorldTrackingConfiguration()
                 await MainActor.run {
-                    session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
-                }
-
-                // セッションのトラッキングが安定するまで待機
-                try await Task.sleep(for: .seconds(0.8))
-
-                // 各AnchorDataからModelEntityを生成（失敗したものはスキップ）
-                var entities: [ModelEntity] = []
-                for anchorData in snapshot.anchors {
-                    if let entity = try? makeMeshEntity(from: anchorData) {
-                        entities.append(entity)
-                    }
-                }
-
-                // 1つも生成できなかった場合はエラー
-                guard !entities.isEmpty else {
-                    await MainActor.run {
-                        self.scanState = .error("メッシュエンティティの生成に失敗しました")
-                    }
-                    return
-                }
-
-                // --- 中心揃えとスケール計算 ---
-
-                // 各エンティティの位置からバウンディングボックスを計算
-                var minPos = entities[0].position
-                var maxPos = entities[0].position
-                for entity in entities {
-                    minPos = min(minPos, entity.position)
-                    maxPos = max(maxPos, entity.position)
-                }
-
-                // バウンディングボックスの中心点
-                let center = (minPos + maxPos) * 0.5
-
-                // 最大辺の長さ（ルームスケールは数m）
-                let size = maxPos - minPos
-                let maxDimension = max(size.x, max(size.y, size.z))
-
-                // カメラ前方で見やすいように0.5mに収まるスケールを計算
-                let targetSize: Float = 0.5
-                let scale = maxDimension > 0.01 ? targetSize / maxDimension : 1.0
-
-                // 全エンティティを束ねる親エンティティを作成
-                let group = Entity()
-                for entity in entities {
-                    // バウンディングボックスの中心が原点に来るようにオフセット
-                    entity.position -= center
-                    group.addChild(entity)
-                }
-
-                // グループをスキャン時のスケールから縮小する
-                group.scale = SIMD3(repeating: scale)
-
-                // ワールド座標 [0, 0, -0.6] = セッション開始位置から前方0.6mに配置
-                let anchor = AnchorEntity(world: [0, 0, -0.6])
-                anchor.addChild(group)
-
-                await MainActor.run {
-                    // シーンの既存アンカーをクリアしてから新しいアンカーを追加
-                    arView.scene.anchors.removeAll()
-                    arView.scene.addAnchor(anchor)
-                    // 表示完了状態に遷移
+                    // VR表示にARカメラは不要なのでセッションを停止
+                    self.arSession?.pause()
+                    self.currentSnapshot = snapshot
                     self.scanState = .displaying
                 }
-
             } catch {
                 await MainActor.run {
                     self.scanState = .error("読み込み失敗: \(error.localizedDescription)")
@@ -273,49 +202,14 @@ final class LiDARScanningViewModel {
         // 収集済みメッシュアンカーをクリア
         meshAnchors.removeAll()
 
+        // VRビューア用スナップショットをクリア
+        currentSnapshot = nil
+
         // 経過秒数をリセット
         elapsedSeconds = 0
 
         // 待機状態に戻す
         scanState = .idle
-    }
-
-    // MARK: - プライベート：メッシュエンティティ生成
-
-    /// AnchorDataからRealityKitのModelEntityを生成する
-    private func makeMeshEntity(from anchorData: MeshSnapshot.AnchorData) throws -> ModelEntity {
-        // 保存済みバイト列から頂点・法線・インデックスを復元
-        let vertices = anchorData.vertices
-        let normals = anchorData.normals
-        let indices = anchorData.indices
-
-        // MeshDescriptorにジオメトリデータを詰める
-        var descriptor = MeshDescriptor()
-
-        // 頂点座標を設定
-        descriptor.positions = MeshBuffer(vertices)
-
-        // 法線ベクトルが存在する場合は設定（ライティングに影響）
-        if !normals.isEmpty {
-            descriptor.normals = MeshBuffer(normals)
-        }
-
-        // 三角形の面インデックスを設定
-        descriptor.primitives = .triangles(indices)
-
-        // MeshDescriptorからMeshResourceを生成（失敗した場合はthrow）
-        let mesh = try MeshResource.generate(from: [descriptor])
-
-        // シアン色のマテリアル（LiDARスキャンメッシュらしい見た目に）
-        let material = SimpleMaterial(color: .cyan, roughness: 0.6, isMetallic: false)
-
-        // ModelEntityを生成
-        let entity = ModelEntity(mesh: mesh, materials: [material])
-
-        // 保存済み変換行列をエンティティに適用（ワールド空間での位置・向きが決まる）
-        entity.transform = Transform(matrix: anchorData.matrix)
-
-        return entity
     }
 
     // MARK: - プライベート：ファイル保存ヘルパー

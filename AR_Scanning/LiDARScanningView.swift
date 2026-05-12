@@ -32,6 +32,19 @@ struct LiDARScanningView: View {
                 lidarUnavailableView
             }
         }
+        // .displaying 状態になるとVRビューアをフルスクリーンで表示
+        .fullScreenCover(
+            isPresented: Binding(
+                get: { viewModel.scanState == .displaying },
+                set: { if !$0 { viewModel.reset() } }
+            )
+        ) {
+            if let snapshot = viewModel.currentSnapshot {
+                MeshViewerView(snapshot: snapshot) {
+                    viewModel.reset()
+                }
+            }
+        }
     }
 
     // MARK: - 操作パネル（状態ごとに切り替え）

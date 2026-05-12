@@ -46,7 +46,12 @@ struct MeshSnapshot: Codable {
             for i in 0..<vertexCount {
                 // offset（バッファ先頭からのずれ）+ stride（1頂点のバイト幅）でアドレスを計算
                 let byteOffset = geometry.vertices.offset + i * geometry.vertices.stride
-                vertices.append(vPtr.load(fromByteOffset: byteOffset, as: SIMD3<Float>.self))
+                // SIMD3<Float>は16バイトアライメントが必要だがMTLBufferは12バイトパックで格納するため、
+                // Floatを1つずつ読み取ってSIMD3を構築しアライメント違反を回避する
+                let x = vPtr.load(fromByteOffset: byteOffset,     as: Float.self)
+                let y = vPtr.load(fromByteOffset: byteOffset + 4, as: Float.self)
+                let z = vPtr.load(fromByteOffset: byteOffset + 8, as: Float.self)
+                vertices.append(SIMD3<Float>(x, y, z))
             }
             // [SIMD3<Float>]をDataに変換（unsafeBytesで生バイトを取り出す）
             self.vertexData = vertices.withUnsafeBytes { Data($0) }
@@ -58,7 +63,11 @@ struct MeshSnapshot: Codable {
             normals.reserveCapacity(normalCount)
             for i in 0..<normalCount {
                 let byteOffset = geometry.normals.offset + i * geometry.normals.stride
-                normals.append(nPtr.load(fromByteOffset: byteOffset, as: SIMD3<Float>.self))
+                // 頂点と同様にFloatを個別に読み取る
+                let x = nPtr.load(fromByteOffset: byteOffset,     as: Float.self)
+                let y = nPtr.load(fromByteOffset: byteOffset + 4, as: Float.self)
+                let z = nPtr.load(fromByteOffset: byteOffset + 8, as: Float.self)
+                normals.append(SIMD3<Float>(x, y, z))
             }
             self.normalData = normals.withUnsafeBytes { Data($0) }
 

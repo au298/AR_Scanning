@@ -70,6 +70,17 @@ struct MeshViewerView: View {
 
         let groupNode = SCNNode()
 
+        // textureImages をキャッシュ（同じインデックスのUIImage変換を繰り返さないため）
+        var textureCache: [Int: UIImage] = [:]
+        func textureImage(at index: Int?) -> UIImage? {
+            guard let idx = index,
+                  idx < snapshot.textureImages.count else { return nil }
+            if let cached = textureCache[idx] { return cached }
+            let img = UIImage(data: snapshot.textureImages[idx])
+            textureCache[idx] = img
+            return img
+        }
+
         // 全頂点のワールド座標バウンディングボックスを計算しながらノードを追加
         var worldMin = SIMD3<Float>(repeating: .infinity)
         var worldMax = SIMD3<Float>(repeating: -.infinity)
@@ -89,7 +100,15 @@ struct MeshViewerView: View {
                 worldMax = max(worldMax, w3)
             }
 
-            if let node = makeNode(vertices: vertices, normals: normals, indices: indices, transform: m) {
+            // アンカーごとに最適フレームのテクスチャを使用
+            if let node = makeNode(
+                vertices: vertices,
+                normals: normals,
+                indices: indices,
+                transform: m,
+                uvCoordinates: anchorData.uvCoordinates,
+                textureImage: textureImage(at: anchorData.textureImageIndex)
+            ) {
                 groupNode.addChildNode(node)
             }
         }
@@ -113,12 +132,16 @@ struct MeshViewerView: View {
         return scene
     }
 
-    /// 頂点・法線・インデックスとアンカー行列からSCNNodeを生成する
+    /// 頂点・法線・インデックス・UV・テクスチャ画像からSCNNodeを生成する
+    /// - uvCoordinatesとtextureImageが揃っていればカメラ画像テクスチャを適用する
+    /// - 揃っていなければ法線ベースの頂点カラーにフォールバックする
     private static func makeNode(
         vertices: [SIMD3<Float>],
         normals: [SIMD3<Float>],
         indices: [UInt32],
-        transform: simd_float4x4
+        transform: simd_float4x4,
+        uvCoordinates: [CGPoint],
+        textureImage: UIImage?
     ) -> SCNNode? {
         // 頂点座標ソース
         let vertexSource = SCNGeometrySource(
@@ -134,6 +157,33 @@ struct MeshViewerView: View {
             sources.append(normalSource)
         }
 
+        let hasTexture = textureImage != nil && uvCoordinates.count == vertices.count
+
+        if hasTexture {
+            // カメラ画像テクスチャ用UVソース
+            // CGPoint(x=u, y=v) を Float2 のバイト列に変換
+            var uvFloats = [Float]()
+            uvFloats.reserveCapacity(uvCoordinates.count * 2)
+            for pt in uvCoordinates {
+                uvFloats.append(Float(pt.x))
+                uvFloats.append(Float(pt.y))
+            }
+            let uvSource = SCNGeometrySource(
+                data: uvFloats.withUnsafeBytes { Data($0) },
+                semantic: .texcoord,
+                vectorCount: uvCoordinates.count,
+                usesFloatComponents: true,
+                componentsPerVector: 2,
+                bytesPerComponent: MemoryLayout<Float>.size,
+                dataOffset: 0,
+                dataStride: MemoryLayout<Float>.size * 2
+            )
+            sources.append(uvSource)
+        } else if !normals.isEmpty {
+            // テクスチャがない場合は法線ベースの頂点カラーにフォールバック
+            sources.append(makeColorSource(from: normals))
+        }
+
         // 三角形インデックスエレメント（UInt32 = bytesPerIndex 4）
         let indexData = indices.withUnsafeBytes { Data($0) }
         let element = SCNGeometryElement(
@@ -145,9 +195,18 @@ struct MeshViewerView: View {
 
         let geometry = SCNGeometry(sources: sources, elements: [element])
 
-        // シアン半透明マテリアル（両面描画でスキャン漏れによる穴を目立たなくする）
         let material = SCNMaterial()
-        material.diffuse.contents = UIColor.cyan.withAlphaComponent(0.85)
+        if hasTexture, let image = textureImage {
+            // カメラ画像をdiffuseテクスチャとして設定
+            // clampでUV範囲外の頂点がエッジピクセルの色になるようにする
+            material.diffuse.contents = image
+            material.diffuse.wrapS = .clamp
+            material.diffuse.wrapT = .clamp
+        } else {
+            // 頂点カラーを活かすためdiffuseをwhiteに設定
+            material.diffuse.contents = UIColor.white
+        }
+        // 両面描画でスキャン漏れによる穴を目立たなくする
         material.isDoubleSided = true
         geometry.materials = [material]
 
@@ -155,5 +214,28 @@ struct MeshViewerView: View {
         // アンカーの変換行列を適用（ワールド座標での位置・向きを復元）
         node.simdTransform = transform
         return node
+    }
+
+    /// 法線ベクトルの各成分 (-1,1) を (0,1) に正規化してRGBAの頂点カラーソースを生成する
+    /// - 上向き面（y≈1）→ 緑系、横向き面（x/z≈1）→ 赤/青系
+    private static func makeColorSource(from normals: [SIMD3<Float>]) -> SCNGeometrySource {
+        var floats = [Float]()
+        floats.reserveCapacity(normals.count * 4)
+        for n in normals {
+            floats.append((n.x + 1) * 0.5)
+            floats.append((n.y + 1) * 0.5)
+            floats.append((n.z + 1) * 0.5)
+            floats.append(1.0) // alpha
+        }
+        return SCNGeometrySource(
+            data: floats.withUnsafeBytes { Data($0) },
+            semantic: .color,
+            vectorCount: normals.count,
+            usesFloatComponents: true,
+            componentsPerVector: 4,
+            bytesPerComponent: MemoryLayout<Float>.size,
+            dataOffset: 0,
+            dataStride: MemoryLayout<Float>.size * 4
+        )
     }
 }

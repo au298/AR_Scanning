@@ -12,6 +12,10 @@ struct MeshSnapshot: Codable {
     /// スキャン中に収集したARMeshAnchorの配列
     var anchors: [AnchorData]
 
+    /// スキャン中にサンプリングした複数のカメラ画像（JPEG圧縮済み）
+    /// 各AnchorDataがtextureImageIndexで最適フレームを指定する
+    var textureImages: [Data]
+
     /// 1つのARMeshAnchorに対応するシリアライズ可能なジオメトリデータ
     struct AnchorData: Codable {
 
@@ -29,6 +33,12 @@ struct MeshSnapshot: Codable {
 
         /// アンカーのワールド変換行列を列優先で16個のFloatに展開して保存
         var transform: [Float]
+
+        /// 各頂点のUV座標をFloatペア（u, v）としてバイト列に保存（頂点数 × 2個）
+        var uvData: Data?
+
+        /// このアンカーが使用するtextureImages配列内のインデックス
+        var textureImageIndex: Int?
 
         // MARK: - ARMeshAnchorからの初期化
 
@@ -135,6 +145,114 @@ struct MeshSnapshot: Codable {
             indexData.withUnsafeBytes { ptr in
                 Array(ptr.bindMemory(to: UInt32.self))
             }
+        }
+
+        /// 保存済みuvDataをCGPoint（x=u, y=v）の配列として復元する
+        var uvCoordinates: [CGPoint] {
+            guard let data = uvData else { return [] }
+            return data.withUnsafeBytes { ptr -> [CGPoint] in
+                let floats = Array(ptr.bindMemory(to: Float.self))
+                var result = [CGPoint]()
+                result.reserveCapacity(floats.count / 2)
+                stride(from: 0, to: floats.count - 1, by: 2).forEach {
+                    result.append(CGPoint(x: CGFloat(floats[$0]), y: CGFloat(floats[$0 + 1])))
+                }
+                return result
+            }
+        }
+
+        // MARK: - 平滑化
+
+        /// ラプラシアン平滑化でLiDARノイズを低減する
+        /// 各頂点を隣接頂点の平均方向に factor だけ移動する操作を iterations 回繰り返す
+        /// - Parameters:
+        ///   - iterations: 繰り返し回数（多いほど滑らか。多すぎると形状が崩れる）
+        ///   - factor: 1回あたりの移動割合 0〜1
+        mutating func smooth(iterations: Int = 2, factor: Float = 0.3) {
+            var verts = vertices
+            let idxs  = indices
+            guard verts.count > 2, !idxs.isEmpty else { return }
+
+            // 三角形インデックスから隣接頂点Setを構築（Set で辺の重複を排除）
+            var neighbors = Array(repeating: Set<Int>(), count: verts.count)
+            for t in stride(from: 0, to: idxs.count - 2, by: 3) {
+                let i0 = Int(idxs[t]), i1 = Int(idxs[t + 1]), i2 = Int(idxs[t + 2])
+                neighbors[i0].formUnion([i1, i2])
+                neighbors[i1].formUnion([i0, i2])
+                neighbors[i2].formUnion([i0, i1])
+            }
+
+            for _ in 0..<iterations {
+                var smoothed = verts
+                for i in 0..<verts.count {
+                    let nbrs = neighbors[i]
+                    guard !nbrs.isEmpty else { continue }
+                    var sum = SIMD3<Float>.zero
+                    for j in nbrs { sum += verts[j] }
+                    let avg = sum / Float(nbrs.count)
+                    // 元の位置から avg 方向に factor だけ移動
+                    smoothed[i] = verts[i] + factor * (avg - verts[i])
+                }
+                verts = smoothed
+            }
+
+            vertexData = verts.withUnsafeBytes { Data($0) }
+        }
+
+        // MARK: - UV計算
+
+        /// カメラパラメータを直接受け取って各頂点をカメラ画像に投影し、UV座標をuvDataに格納する
+        /// - Parameters:
+        ///   - cameraTransform: カメラのワールド変換行列
+        ///   - intrinsics: カメラ内部パラメータ行列（landscapeRight基準）
+        ///   - imageResolution: カメラ画像の解像度
+        /// - Note: ARKit座標系ではカメラは-z方向を向く。camPos.z < 0 が前方。
+        ///         SceneKitのUVはV=0が下なのでV軸を反転して保存する。
+        mutating func computeUVs(
+            cameraTransform: simd_float4x4,
+            intrinsics: simd_float3x3,
+            imageResolution: CGSize
+        ) {
+            let verts = vertices
+            let anchorMatrix = matrix
+            let viewMatrix = cameraTransform.inverse
+
+            let fx   = intrinsics.columns.0.x
+            let fy   = intrinsics.columns.1.y
+            let cx   = intrinsics.columns.2.x
+            let cy   = intrinsics.columns.2.y
+            let imgW = Float(imageResolution.width)
+            let imgH = Float(imageResolution.height)
+
+            var uvFloats = [Float]()
+            uvFloats.reserveCapacity(verts.count * 2)
+
+            for v in verts {
+                // ローカル → ワールド座標
+                let w4 = anchorMatrix * SIMD4<Float>(v.x, v.y, v.z, 1)
+                let wp = SIMD3<Float>(w4.x / w4.w, w4.y / w4.w, w4.z / w4.w)
+
+                // ワールド → カメラ座標
+                let c4 = viewMatrix * SIMD4<Float>(wp.x, wp.y, wp.z, 1)
+
+                let u: Float
+                let vCoord: Float
+                if c4.z < 0 {
+                    // カメラ前方: 内部パラメータで画素座標へ投影
+                    let xImg = fx * (c4.x / (-c4.z)) + cx
+                    let yImg = fy * (c4.y / (-c4.z)) + cy
+                    u      = xImg / imgW
+                    vCoord = 1.0 - yImg / imgH   // SceneKit UV は V=0 が下
+                } else {
+                    // カメラ背後: 中心にフォールバック（clamp で端色になる）
+                    u      = 0.5
+                    vCoord = 0.5
+                }
+                uvFloats.append(u)
+                uvFloats.append(vCoord)
+            }
+
+            self.uvData = uvFloats.withUnsafeBytes { Data($0) }
         }
     }
 }

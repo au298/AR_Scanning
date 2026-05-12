@@ -70,6 +70,9 @@ struct MeshViewerView: View {
 
         let groupNode = SCNNode()
 
+        // スナップショットにカメラ画像が含まれていればUIImageに変換してテクスチャに使用
+        let textureImage: UIImage? = snapshot.textureImageData.flatMap { UIImage(data: $0) }
+
         // 全頂点のワールド座標バウンディングボックスを計算しながらノードを追加
         var worldMin = SIMD3<Float>(repeating: .infinity)
         var worldMax = SIMD3<Float>(repeating: -.infinity)
@@ -89,7 +92,14 @@ struct MeshViewerView: View {
                 worldMax = max(worldMax, w3)
             }
 
-            if let node = makeNode(vertices: vertices, normals: normals, indices: indices, transform: m) {
+            if let node = makeNode(
+                vertices: vertices,
+                normals: normals,
+                indices: indices,
+                transform: m,
+                uvCoordinates: anchorData.uvCoordinates,
+                textureImage: textureImage
+            ) {
                 groupNode.addChildNode(node)
             }
         }
@@ -113,12 +123,16 @@ struct MeshViewerView: View {
         return scene
     }
 
-    /// 頂点・法線・インデックスとアンカー行列からSCNNodeを生成する
+    /// 頂点・法線・インデックス・UV・テクスチャ画像からSCNNodeを生成する
+    /// - uvCoordinatesとtextureImageが揃っていればカメラ画像テクスチャを適用する
+    /// - 揃っていなければ法線ベースの頂点カラーにフォールバックする
     private static func makeNode(
         vertices: [SIMD3<Float>],
         normals: [SIMD3<Float>],
         indices: [UInt32],
-        transform: simd_float4x4
+        transform: simd_float4x4,
+        uvCoordinates: [CGPoint],
+        textureImage: UIImage?
     ) -> SCNNode? {
         // 頂点座標ソース
         let vertexSource = SCNGeometrySource(
@@ -132,11 +146,33 @@ struct MeshViewerView: View {
                 normals: normals.map { SCNVector3($0.x, $0.y, $0.z) }
             )
             sources.append(normalSource)
+        }
 
-            // 法線方向をRGBにマッピングした頂点カラー
-            // 各成分を (-1,1) → (0,1) に変換: 壁・床・天井が自然に異なる色になる
-            let colorSource = makeColorSource(from: normals)
-            sources.append(colorSource)
+        let hasTexture = textureImage != nil && uvCoordinates.count == vertices.count
+
+        if hasTexture {
+            // カメラ画像テクスチャ用UVソース
+            // CGPoint(x=u, y=v) を Float2 のバイト列に変換
+            var uvFloats = [Float]()
+            uvFloats.reserveCapacity(uvCoordinates.count * 2)
+            for pt in uvCoordinates {
+                uvFloats.append(Float(pt.x))
+                uvFloats.append(Float(pt.y))
+            }
+            let uvSource = SCNGeometrySource(
+                data: uvFloats.withUnsafeBytes { Data($0) },
+                semantic: .texcoord,
+                vectorCount: uvCoordinates.count,
+                usesFloatComponents: true,
+                componentsPerVector: 2,
+                bytesPerComponent: MemoryLayout<Float>.size,
+                dataOffset: 0,
+                dataStride: MemoryLayout<Float>.size * 2
+            )
+            sources.append(uvSource)
+        } else if !normals.isEmpty {
+            // テクスチャがない場合は法線ベースの頂点カラーにフォールバック
+            sources.append(makeColorSource(from: normals))
         }
 
         // 三角形インデックスエレメント（UInt32 = bytesPerIndex 4）
@@ -150,9 +186,18 @@ struct MeshViewerView: View {
 
         let geometry = SCNGeometry(sources: sources, elements: [element])
 
-        // 頂点カラーを活かすためdiffuseをwhiteに設定（両面描画でスキャン漏れを目立たなくする）
         let material = SCNMaterial()
-        material.diffuse.contents = UIColor.white
+        if hasTexture, let image = textureImage {
+            // カメラ画像をdiffuseテクスチャとして設定
+            // clampでUV範囲外の頂点がエッジピクセルの色になるようにする
+            material.diffuse.contents = image
+            material.diffuse.wrapS = .clamp
+            material.diffuse.wrapT = .clamp
+        } else {
+            // 頂点カラーを活かすためdiffuseをwhiteに設定
+            material.diffuse.contents = UIColor.white
+        }
+        // 両面描画でスキャン漏れによる穴を目立たなくする
         material.isDoubleSided = true
         geometry.materials = [material]
 

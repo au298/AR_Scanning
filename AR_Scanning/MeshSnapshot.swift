@@ -12,6 +12,9 @@ struct MeshSnapshot: Codable {
     /// スキャン中に収集したARMeshAnchorの配列
     var anchors: [AnchorData]
 
+    /// スキャン停止時のカメラ画像（JPEG圧縮済み）。メッシュのテクスチャとして使用
+    var textureImageData: Data?
+
     /// 1つのARMeshAnchorに対応するシリアライズ可能なジオメトリデータ
     struct AnchorData: Codable {
 
@@ -29,6 +32,9 @@ struct MeshSnapshot: Codable {
 
         /// アンカーのワールド変換行列を列優先で16個のFloatに展開して保存
         var transform: [Float]
+
+        /// 各頂点のUV座標をFloatペア（u, v）としてバイト列に保存（頂点数 × 2個）
+        var uvData: Data?
 
         // MARK: - ARMeshAnchorからの初期化
 
@@ -135,6 +141,57 @@ struct MeshSnapshot: Codable {
             indexData.withUnsafeBytes { ptr in
                 Array(ptr.bindMemory(to: UInt32.self))
             }
+        }
+
+        /// 保存済みuvDataをCGPoint（x=u, y=v）の配列として復元する
+        var uvCoordinates: [CGPoint] {
+            guard let data = uvData else { return [] }
+            return data.withUnsafeBytes { ptr -> [CGPoint] in
+                let floats = Array(ptr.bindMemory(to: Float.self))
+                var result = [CGPoint]()
+                result.reserveCapacity(floats.count / 2)
+                stride(from: 0, to: floats.count - 1, by: 2).forEach {
+                    result.append(CGPoint(x: CGFloat(floats[$0]), y: CGFloat(floats[$0 + 1])))
+                }
+                return result
+            }
+        }
+
+        // MARK: - UV計算
+
+        /// ARFrameのカメラを使って各頂点をカメラ画像に投影し、UV座標をuvDataに格納する
+        /// - Parameter frame: スキャン停止時のARFrame（カメラ姿勢・内部パラメータを使用）
+        /// - Note: カメラ画像はARKitの都合でlandscape取得のため、.landscapeRightで投影する
+        ///         SCNKitのUVはV=0が下なのでV軸を反転して保存する
+        mutating func computeUVs(from frame: ARFrame) {
+            let verts = vertices
+            let m = matrix
+            // ARKitのcapturedImageはlandscapeセンサーのためwidthが大きい
+            let imageSize = frame.camera.imageResolution
+
+            var uvFloats = [Float]()
+            uvFloats.reserveCapacity(verts.count * 2)
+
+            for v in verts {
+                // ローカル → ワールド座標
+                let world4 = m * SIMD4<Float>(v.x, v.y, v.z, 1)
+                let worldPos = simd_float3(world4.x / world4.w,
+                                           world4.y / world4.w,
+                                           world4.z / world4.w)
+
+                // ARKit標準APIでカメラ画像上の画素座標を取得
+                let px = frame.camera.projectPoint(worldPos,
+                                                    orientation: .landscapeRight,
+                                                    viewportSize: imageSize)
+
+                // 画素座標をUV正規化し、SceneKitに合わせてV軸を反転（画像原点は左上、UV原点は左下）
+                let u     = Float(px.x / imageSize.width)
+                let vCoord = 1.0 - Float(px.y / imageSize.height)
+                uvFloats.append(u)
+                uvFloats.append(vCoord)
+            }
+
+            self.uvData = uvFloats.withUnsafeBytes { Data($0) }
         }
     }
 }

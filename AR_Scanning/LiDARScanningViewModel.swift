@@ -5,6 +5,8 @@
 
 import ARKit
 import RealityKit
+import CoreImage
+import UIKit
 
 /// LiDARスキャン・保存・メッシュAR表示を一括管理するViewModel
 @Observable
@@ -115,6 +117,9 @@ final class LiDARScanningViewModel {
         // ※ セッションが動いている間だけMTLBufferは有効なので、ここでスナップショットを取る
         let anchorsToSave = Array(meshAnchors.values)
 
+        // テクスチャ用にスキャン停止時点のカメラフレームを取得（UV計算にも使用）
+        let capturedFrame = arSession?.currentFrame
+
         // スキャンが不十分でメッシュがない場合
         guard !anchorsToSave.isEmpty else {
             scanState = .error("メッシュデータがありません\nもう少し部屋をスキャンしてください")
@@ -127,9 +132,20 @@ final class LiDARScanningViewModel {
         // ジオメトリのシリアライズとファイル書き込みは重いので非同期で実行
         Task {
             do {
-                // 各ARMeshAnchorからAnchorDataを生成してMeshSnapshotにまとめる
+                // 各ARMeshAnchorからAnchorDataを生成し、カメラ画像が取れていればUVを計算
+                var anchorDataArray = anchorsToSave.map { MeshSnapshot.AnchorData(from: $0) }
+                if let frame = capturedFrame {
+                    for i in anchorDataArray.indices {
+                        anchorDataArray[i].computeUVs(from: frame)
+                    }
+                }
+
+                // カメラ画像をJPEG圧縮してテクスチャデータとして保存
+                let textureData = capturedFrame.flatMap { captureTextureJPEG(from: $0) }
+
                 let snapshot = MeshSnapshot(
-                    anchors: anchorsToSave.map { MeshSnapshot.AnchorData(from: $0) }
+                    anchors: anchorDataArray,
+                    textureImageData: textureData
                 )
 
                 // バイナリPropertyListとしてエンコード（JSONより大幅に小さい）
@@ -213,6 +229,15 @@ final class LiDARScanningViewModel {
     }
 
     // MARK: - プライベート：ファイル保存ヘルパー
+
+    /// ARFrameのcapturedImage（YCbCr CVPixelBuffer）をJPEGのDataに変換する
+    /// - CIContextをソフトウェアレンダラーなしで使い、GPU変換を優先する
+    private func captureTextureJPEG(from frame: ARFrame) -> Data? {
+        let ciImage = CIImage(cvPixelBuffer: frame.capturedImage)
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }
+        return UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.85)
+    }
 
     /// タイムスタンプ付きのメッシュ保存先URLを生成する
     private func buildSaveURL() throws -> URL {

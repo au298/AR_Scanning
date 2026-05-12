@@ -79,11 +79,20 @@ final class LiDARScanningViewModel {
         // ARWorldTrackingConfigurationを生成（6DOF空間追跡の設定クラス）
         let configuration = ARWorldTrackingConfiguration()
 
-        // LiDARによるリアルタイムメッシュ再構成を有効化（これによりARMeshAnchorが届く）
-        configuration.sceneReconstruction = .mesh
+        // 壁・床・天井・家具などを分類しながらメッシュ再構成（.meshより形状精度が高い）
+        configuration.sceneReconstruction = .meshWithClassification
 
         // 平面検出を有効化（床・壁の検出に使用）
         configuration.planeDetection = [.horizontal, .vertical]
+
+        // フレームレートが高いほどARKitに渡せるデータが増えてメッシュの更新が速くなる
+        // 60fps対応フォーマットがあれば優先して使用し、なければデフォルトにフォールバック
+        let highFPSFormat = ARWorldTrackingConfiguration.supportedVideoFormats.first {
+            $0.framesPerSecond >= 60
+        }
+        if let format = highFPSFormat {
+            configuration.videoFormat = format
+        }
 
         // このデバイスがシーン深度フレームをサポートしているなら有効化
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {

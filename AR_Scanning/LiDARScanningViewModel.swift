@@ -72,8 +72,8 @@ final class LiDARScanningViewModel {
 
         let configuration = ARWorldTrackingConfiguration()
 
-        // 壁・床・天井・家具などを分類しながらメッシュ再構成（.meshより形状精度が高い）
-        configuration.sceneReconstruction = .meshWithClassification
+        // 生のLiDARメッシュを最高精度で再構成（.meshWithClassificationは分類のため平滑化が入り細部が失われる）
+        configuration.sceneReconstruction = .mesh
         configuration.planeDetection = [.horizontal, .vertical]
 
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {

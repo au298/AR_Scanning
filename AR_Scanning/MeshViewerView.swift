@@ -132,6 +132,11 @@ struct MeshViewerView: View {
                 normals: normals.map { SCNVector3($0.x, $0.y, $0.z) }
             )
             sources.append(normalSource)
+
+            // 法線方向をRGBにマッピングした頂点カラー
+            // 各成分を (-1,1) → (0,1) に変換: 壁・床・天井が自然に異なる色になる
+            let colorSource = makeColorSource(from: normals)
+            sources.append(colorSource)
         }
 
         // 三角形インデックスエレメント（UInt32 = bytesPerIndex 4）
@@ -145,9 +150,9 @@ struct MeshViewerView: View {
 
         let geometry = SCNGeometry(sources: sources, elements: [element])
 
-        // シアン半透明マテリアル（両面描画でスキャン漏れによる穴を目立たなくする）
+        // 頂点カラーを活かすためdiffuseをwhiteに設定（両面描画でスキャン漏れを目立たなくする）
         let material = SCNMaterial()
-        material.diffuse.contents = UIColor.cyan.withAlphaComponent(0.85)
+        material.diffuse.contents = UIColor.white
         material.isDoubleSided = true
         geometry.materials = [material]
 
@@ -155,5 +160,28 @@ struct MeshViewerView: View {
         // アンカーの変換行列を適用（ワールド座標での位置・向きを復元）
         node.simdTransform = transform
         return node
+    }
+
+    /// 法線ベクトルの各成分 (-1,1) を (0,1) に正規化してRGBAの頂点カラーソースを生成する
+    /// - 上向き面（y≈1）→ 緑系、横向き面（x/z≈1）→ 赤/青系
+    private static func makeColorSource(from normals: [SIMD3<Float>]) -> SCNGeometrySource {
+        var floats = [Float]()
+        floats.reserveCapacity(normals.count * 4)
+        for n in normals {
+            floats.append((n.x + 1) * 0.5)
+            floats.append((n.y + 1) * 0.5)
+            floats.append((n.z + 1) * 0.5)
+            floats.append(1.0) // alpha
+        }
+        return SCNGeometrySource(
+            data: floats.withUnsafeBytes { Data($0) },
+            semantic: .color,
+            vectorCount: normals.count,
+            usesFloatComponents: true,
+            componentsPerVector: 4,
+            bytesPerComponent: MemoryLayout<Float>.size,
+            dataOffset: 0,
+            dataStride: MemoryLayout<Float>.size * 4
+        )
     }
 }

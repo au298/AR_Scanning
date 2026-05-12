@@ -8,6 +8,15 @@ import RealityKit
 import CoreImage
 import UIKit
 
+/// スキャン中にサンプリングした1フレームの軽量なカメラ記録
+/// ARFrameをそのまま保持するとメモリが圧迫されるので必要な情報だけ抽出して保持する
+private struct SampledFrame {
+    let cameraTransform: simd_float4x4
+    let intrinsics: simd_float3x3
+    let imageResolution: CGSize
+    let jpegData: Data
+}
+
 /// LiDARスキャン・保存・メッシュAR表示を一括管理するViewModel
 @Observable
 final class LiDARScanningViewModel {
@@ -59,6 +68,14 @@ final class LiDARScanningViewModel {
     @ObservationIgnored
     private var timer: Timer?
 
+    /// 1秒ごとにカメラフレームをサンプリングするタイマー
+    @ObservationIgnored
+    private var samplingTimer: Timer?
+
+    /// スキャン中に収集したカメラフレーム（最大8枚、古いものから順に上書き）
+    @ObservationIgnored
+    private var sampledFrames: [SampledFrame] = []
+
     // MARK: - 初期化
 
     init() {
@@ -75,6 +92,7 @@ final class LiDARScanningViewModel {
 
         // 前回のスキャンデータをクリア
         meshAnchors.removeAll()
+        sampledFrames.removeAll()
 
         // ARWorldTrackingConfigurationを生成（6DOF空間追跡の設定クラス）
         let configuration = ARWorldTrackingConfiguration()
@@ -112,62 +130,85 @@ final class LiDARScanningViewModel {
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.elapsedSeconds += 1
         }
+
+        // 1秒ごとにカメラフレームをサンプリング（最大8枚蓄積してテクスチャ精度を向上）
+        samplingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.sampleCurrentFrame()
+        }
     }
 
     // MARK: - スキャン停止 & 保存
 
     /// スキャンを停止してメッシュジオメトリをDocumentsディレクトリに保存する
     func stopAndSave() {
-        // タイマーを停止
         timer?.invalidate()
         timer = nil
+        samplingTimer?.invalidate()
+        samplingTimer = nil
 
         // この時点でセッションデリゲートが収集したARMeshAnchorをコピーする
         // ※ セッションが動いている間だけMTLBufferは有効なので、ここでスナップショットを取る
         let anchorsToSave = Array(meshAnchors.values)
 
-        // テクスチャ用にスキャン停止時点のカメラフレームを取得（UV計算にも使用）
-        let capturedFrame = arSession?.currentFrame
+        // 停止直前のフレームも取得（サンプリングのタイミングによっては最後の1秒が抜ける可能性があるため）
+        let lastFrame = arSession?.currentFrame
 
-        // スキャンが不十分でメッシュがない場合
         guard !anchorsToSave.isEmpty else {
             scanState = .error("メッシュデータがありません\nもう少し部屋をスキャンしてください")
             return
         }
 
-        // 保存処理中状態に遷移
         scanState = .saving
 
-        // ジオメトリのシリアライズとファイル書き込みは重いので非同期で実行
+        // 蓄積済みフレームをコピー（Taskに渡すためにスナップショット化）
+        var framesSnapshot = sampledFrames
+
         Task {
             do {
-                // 各ARMeshAnchorからAnchorDataを生成し、カメラ画像が取れていればUVを計算
-                var anchorDataArray = anchorsToSave.map { MeshSnapshot.AnchorData(from: $0) }
-                if let frame = capturedFrame {
-                    for i in anchorDataArray.indices {
-                        anchorDataArray[i].computeUVs(from: frame)
-                    }
+                // 停止直前のフレームを最後に追加（まだサンプリングされていない場合）
+                if let frame = lastFrame,
+                   let jpeg = pixelBufferToJPEG(frame.capturedImage) {
+                    if framesSnapshot.count >= 8 { framesSnapshot.removeFirst() }
+                    framesSnapshot.append(SampledFrame(
+                        cameraTransform: frame.camera.transform,
+                        intrinsics: frame.camera.intrinsics,
+                        imageResolution: frame.camera.imageResolution,
+                        jpegData: jpeg
+                    ))
                 }
 
-                // カメラ画像をJPEG圧縮してテクスチャデータとして保存
-                let textureData = capturedFrame.flatMap { captureTextureJPEG(from: $0) }
+                // 各アンカーに最適フレームを選択してUVを計算
+                var anchorDataArray: [MeshSnapshot.AnchorData] = anchorsToSave.map {
+                    MeshSnapshot.AnchorData(from: $0)
+                }
 
-                let snapshot = MeshSnapshot(
-                    anchors: anchorDataArray,
-                    textureImageData: textureData
-                )
+                for i in anchorDataArray.indices {
+                    guard let bestIdx = bestFrameIndex(for: anchorsToSave[i], in: framesSnapshot) else {
+                        continue
+                    }
+                    let best = framesSnapshot[bestIdx]
+                    anchorDataArray[i].computeUVs(
+                        cameraTransform: best.cameraTransform,
+                        intrinsics: best.intrinsics,
+                        imageResolution: best.imageResolution
+                    )
+                    anchorDataArray[i].textureImageIndex = bestIdx
+                }
+
+                // 全サンプルフレームのJPEGを配列で保存（各アンカーがインデックスで参照）
+                let textureImages = framesSnapshot.map { $0.jpegData }
+
+                let snapshot = MeshSnapshot(anchors: anchorDataArray, textureImages: textureImages)
 
                 // バイナリPropertyListとしてエンコード（JSONより大幅に小さい）
                 let encoder = PropertyListEncoder()
                 encoder.outputFormat = .binary
                 let data = try encoder.encode(snapshot)
 
-                // 保存先URLを生成してファイルに書き込む
                 let url = try buildSaveURL()
                 try data.write(to: url, options: .atomic)
 
                 await MainActor.run {
-                    // 保存完了状態に遷移（URLを持たせる）
                     self.scanState = .saved(url)
                 }
             } catch {
@@ -214,53 +255,135 @@ final class LiDARScanningViewModel {
 
     /// 全状態をリセットして待機画面に戻る
     func reset() {
-        // タイマーを停止
         timer?.invalidate()
         timer = nil
+        samplingTimer?.invalidate()
+        samplingTimer = nil
 
-        // ARセッションを一時停止
         arSession?.pause()
-
-        // シーン上のアンカーをすべて削除
         arView?.scene.anchors.removeAll()
-
-        // 収集済みメッシュアンカーをクリア
         meshAnchors.removeAll()
-
-        // VRビューア用スナップショットをクリア
+        sampledFrames.removeAll()
         currentSnapshot = nil
-
-        // 経過秒数をリセット
         elapsedSeconds = 0
-
-        // 待機状態に戻す
         scanState = .idle
+    }
+
+    // MARK: - プライベート：フレームサンプリング
+
+    /// 現在のARFrameを取得してJPEG変換し、sampledFramesに追加する
+    /// - 8枚を上限とし、超えた場合は最古のフレームを削除する
+    /// - JPEG変換はバックグラウンドTaskで実行してメインスレッドをブロックしない
+    private func sampleCurrentFrame() {
+        guard let frame = arSession?.currentFrame else { return }
+
+        // キャプチャに必要な値をメインスレッドで即取得（frameの参照は保持されるが早めに処理する）
+        let cameraTransform  = frame.camera.transform
+        let intrinsics       = frame.camera.intrinsics
+        let imageResolution  = frame.camera.imageResolution
+        let pixelBuffer      = frame.capturedImage
+
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self,
+                  let jpegData = self.pixelBufferToJPEG(pixelBuffer) else { return }
+
+            let sampled = SampledFrame(
+                cameraTransform: cameraTransform,
+                intrinsics: intrinsics,
+                imageResolution: imageResolution,
+                jpegData: jpegData
+            )
+            await MainActor.run {
+                if self.sampledFrames.count >= 8 { self.sampledFrames.removeFirst() }
+                self.sampledFrames.append(sampled)
+            }
+        }
+    }
+
+    // MARK: - プライベート：最適フレーム選択
+
+    /// アンカーに対してサンプル済みフレームの中から最も正面から捉えたフレームのインデックスを返す
+    /// - 正面度（dot積）× 距離スコアで採点し、最高スコアのフレームを選ぶ
+    /// - カメラ背後・画像フレーム外のアンカーは候補から除外する
+    private func bestFrameIndex(for anchor: ARMeshAnchor, in frames: [SampledFrame]) -> Int? {
+        guard !frames.isEmpty else { return nil }
+
+        // アンカー中心のワールド座標
+        let t = anchor.transform.columns.3
+        let anchorCenter = SIMD3<Float>(t.x, t.y, t.z)
+
+        var bestScore: Float = -.infinity
+        var bestIndex: Int?
+
+        for (i, frame) in frames.enumerated() {
+            let ct = frame.cameraTransform.columns.3
+            let camPos = SIMD3<Float>(ct.x, ct.y, ct.z)
+
+            let toAnchor = anchorCenter - camPos
+            let distance = simd_length(toAnchor)
+            guard distance > 0.05 else { continue }
+
+            // カメラ前方ベクトル（ワールド空間）: カメラ変換行列の -z 列
+            let fwd = SIMD3<Float>(
+                -frame.cameraTransform.columns.2.x,
+                -frame.cameraTransform.columns.2.y,
+                -frame.cameraTransform.columns.2.z
+            )
+            // アンカーがカメラ前方70度以内にあるか
+            let dot = simd_dot(simd_normalize(toAnchor), fwd)
+            guard dot > 0.1 else { continue }
+
+            // アンカー中心が画像内に収まっているか（手動投影で確認）
+            let viewMatrix = frame.cameraTransform.inverse
+            let c4 = viewMatrix * SIMD4<Float>(anchorCenter.x, anchorCenter.y, anchorCenter.z, 1)
+            guard c4.z < 0 else { continue }
+
+            let fx = frame.intrinsics.columns.0.x
+            let fy = frame.intrinsics.columns.1.y
+            let cx = frame.intrinsics.columns.2.x
+            let cy = frame.intrinsics.columns.2.y
+            let xImg = fx * (c4.x / (-c4.z)) + cx
+            let yImg = fy * (c4.y / (-c4.z)) + cy
+            let margin = Float(min(frame.imageResolution.width, frame.imageResolution.height)) * 0.05
+            guard xImg > margin,
+                  xImg < Float(frame.imageResolution.width)  - margin,
+                  yImg > margin,
+                  yImg < Float(frame.imageResolution.height) - margin else { continue }
+
+            // 距離スコア：0.5m〜2mが最適、それ以外は減衰
+            let distScore: Float = distance > 0.5 && distance < 2.0
+                ? 1.0
+                : max(0.3, 1.0 - abs(distance - 1.25) / 2.5)
+
+            let score = dot * distScore
+            if score > bestScore {
+                bestScore = score
+                bestIndex = i
+            }
+        }
+
+        return bestIndex
     }
 
     // MARK: - プライベート：ファイル保存ヘルパー
 
-    /// ARFrameのcapturedImage（YCbCr CVPixelBuffer）をJPEGのDataに変換する
-    /// - CIContextをソフトウェアレンダラーなしで使い、GPU変換を優先する
-    private func captureTextureJPEG(from frame: ARFrame) -> Data? {
-        let ciImage = CIImage(cvPixelBuffer: frame.capturedImage)
+    /// CVPixelBuffer（YCbCr形式）をJPEGのDataに変換する
+    private func pixelBufferToJPEG(_ buffer: CVPixelBuffer, quality: CGFloat = 0.82) -> Data? {
+        let ciImage = CIImage(cvPixelBuffer: buffer)
         let context = CIContext(options: [.useSoftwareRenderer: false])
         guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }
-        return UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.85)
+        return UIImage(cgImage: cgImage).jpegData(compressionQuality: quality)
     }
 
     /// タイムスタンプ付きのメッシュ保存先URLを生成する
     private func buildSaveURL() throws -> URL {
-        // Documentsディレクトリのパスを取得
         guard let documents = FileManager.default.urls(
             for: .documentDirectory,
             in: .userDomainMask
         ).first else {
             throw URLError(.fileDoesNotExist)
         }
-
-        // Unixタイムスタンプをファイル名に使って一意にする（拡張子は.echomesh）
         let fileName = "mesh_\(Int(Date().timeIntervalSince1970)).echomesh"
-
         return documents.appendingPathComponent(fileName)
     }
 }

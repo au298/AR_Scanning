@@ -70,8 +70,16 @@ struct MeshViewerView: View {
 
         let groupNode = SCNNode()
 
-        // スナップショットにカメラ画像が含まれていればUIImageに変換してテクスチャに使用
-        let textureImage: UIImage? = snapshot.textureImageData.flatMap { UIImage(data: $0) }
+        // textureImages をキャッシュ（同じインデックスのUIImage変換を繰り返さないため）
+        var textureCache: [Int: UIImage] = [:]
+        func textureImage(at index: Int?) -> UIImage? {
+            guard let idx = index,
+                  idx < snapshot.textureImages.count else { return nil }
+            if let cached = textureCache[idx] { return cached }
+            let img = UIImage(data: snapshot.textureImages[idx])
+            textureCache[idx] = img
+            return img
+        }
 
         // 全頂点のワールド座標バウンディングボックスを計算しながらノードを追加
         var worldMin = SIMD3<Float>(repeating: .infinity)
@@ -92,13 +100,14 @@ struct MeshViewerView: View {
                 worldMax = max(worldMax, w3)
             }
 
+            // アンカーごとに最適フレームのテクスチャを使用
             if let node = makeNode(
                 vertices: vertices,
                 normals: normals,
                 indices: indices,
                 transform: m,
                 uvCoordinates: anchorData.uvCoordinates,
-                textureImage: textureImage
+                textureImage: textureImage(at: anchorData.textureImageIndex)
             ) {
                 groupNode.addChildNode(node)
             }

@@ -161,6 +161,44 @@ struct MeshSnapshot: Codable {
             }
         }
 
+        // MARK: - 平滑化
+
+        /// ラプラシアン平滑化でLiDARノイズを低減する
+        /// 各頂点を隣接頂点の平均方向に factor だけ移動する操作を iterations 回繰り返す
+        /// - Parameters:
+        ///   - iterations: 繰り返し回数（多いほど滑らか。多すぎると形状が崩れる）
+        ///   - factor: 1回あたりの移動割合 0〜1
+        mutating func smooth(iterations: Int = 2, factor: Float = 0.3) {
+            var verts = vertices
+            let idxs  = indices
+            guard verts.count > 2, !idxs.isEmpty else { return }
+
+            // 三角形インデックスから隣接頂点Setを構築（Set で辺の重複を排除）
+            var neighbors = Array(repeating: Set<Int>(), count: verts.count)
+            for t in stride(from: 0, to: idxs.count - 2, by: 3) {
+                let i0 = Int(idxs[t]), i1 = Int(idxs[t + 1]), i2 = Int(idxs[t + 2])
+                neighbors[i0].formUnion([i1, i2])
+                neighbors[i1].formUnion([i0, i2])
+                neighbors[i2].formUnion([i0, i1])
+            }
+
+            for _ in 0..<iterations {
+                var smoothed = verts
+                for i in 0..<verts.count {
+                    let nbrs = neighbors[i]
+                    guard !nbrs.isEmpty else { continue }
+                    var sum = SIMD3<Float>.zero
+                    for j in nbrs { sum += verts[j] }
+                    let avg = sum / Float(nbrs.count)
+                    // 元の位置から avg 方向に factor だけ移動
+                    smoothed[i] = verts[i] + factor * (avg - verts[i])
+                }
+                verts = smoothed
+            }
+
+            vertexData = verts.withUnsafeBytes { Data($0) }
+        }
+
         // MARK: - UV計算
 
         /// カメラパラメータを直接受け取って各頂点をカメラ画像に投影し、UV座標をuvDataに格納する

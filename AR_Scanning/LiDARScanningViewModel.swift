@@ -145,6 +145,11 @@ final class LiDARScanningViewModel {
                     MeshSnapshot.AnchorData(from: $0)
                 }
 
+                // LiDARノイズをラプラシアン平滑化で低減（UV計算前に実行して精度を合わせる）
+                for i in anchorDataArray.indices {
+                    anchorDataArray[i].smooth()
+                }
+
                 for i in anchorDataArray.indices {
                     guard let bestIdx = self.bestFrameIndex(for: anchorsToSave[i], in: frames) else {
                         continue
